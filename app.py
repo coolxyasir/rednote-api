@@ -19,7 +19,7 @@ def add_cors_headers(resp):
 
 @app.route("/")
 def home():
-    return jsonify({"service": "rednote-api", "version": "curl_cffi-v4-tokenfix"})
+    return jsonify({"service": "rednote-api", "version": "curl_cffi-v6-dual-ks-rn"})
 
 
 def unesc(s):
@@ -31,7 +31,6 @@ def unesc(s):
 
 
 def full_unquote(s):
-    # Token jo bhi baar encode hua hai, sab decode karo (jab tak stable na ho)
     for _ in range(4):
         if "%" not in s:
             break
@@ -44,6 +43,10 @@ def full_unquote(s):
             break
     return s
 
+
+# ══════════════════════════════════════════════
+#                    REDNOTE
+# ══════════════════════════════════════════════
 
 def find_video(flat):
     for pat in [
@@ -75,13 +78,11 @@ def rednote():
     try:
         s = cr.Session(impersonate="chrome124")
 
-        # 0) Warm-up — xiaohongshu cookies establish karo
         try:
             s.get("https://www.xiaohongshu.com/", headers={"User-Agent": UA_PC}, timeout=10)
         except Exception:
             pass
 
-        # 1) Short link resolve (original URL query string MEHFOOZ rakho!)
         final = link
         for _ in range(5):
             r = s.get(final, allow_redirects=False, headers={
@@ -94,29 +95,25 @@ def rednote():
                 continue
             break
 
-        # 2) Login/captcha redirect → redirectPath (SIRF ek decode yahan — asli URL wapas)
         original_note_url = None
         for _ in range(2):
             if re.search(r"xiaohongshu\.com/(login|website-login)", final, re.I):
                 m = re.search(r"redirectPath=([^&]+)", final)
                 if m:
-                    rp = unquote(m.group(1))  # redirectPath ka apna encoding kholo
-                    original_note_url = rp    # jaisa hai waisa save karo (inner params apne encoding me)
+                    rp = unquote(m.group(1))
+                    original_note_url = rp
                     final = rp
 
-        # 3) Note ID
         m = re.search(r"/(?:explore|discovery/item)/([0-9a-zA-Z]+)", final)
         if not m:
             return jsonify({"error": "Note ID nahi mili", **({"finalUrl": final} if debug else {})}), 400
         note_id = m.group(1)
 
-        # 4) Token — FULL decode (double/triple encoding ka kachra saaf)
         t = re.search(r"xsec_token=([^&]+)", final)
         token = full_unquote(t.group(1)) if t else ""
         src = re.search(r"xsec_source=([^&]+)", final)
         source = full_unquote(src.group(1)) if src else "app_share"
 
-        # 5) Try-list — ORIGINAL URL pehle (jaisa redirect me mila), phir rebuilt
         candidates = []
         if original_note_url and "/discovery/item/" in original_note_url:
             candidates.append(("original-discovery", original_note_url, UA_MOB))
@@ -169,7 +166,7 @@ def rednote():
 
         if debug and not video:
             idx = best_flat.find("serverRequestInfo")
-            errsnippet = best_flat[idx:idx+200] if idx >= 0 else "(serverRequestInfo nahi mila)"
+            errsnippet = best_flat[idx:idx + 200] if idx >= 0 else "(serverRequestInfo nahi mila)"
             return jsonify({
                 "error": "Video URL nahi mila", "noteId": note_id,
                 "tokenLen": len(token), "tokenTail": token[-6:] if token else None,
@@ -216,6 +213,149 @@ def rednote():
             "title": (title or desc or "RedNote Video").strip(),
             "cover": cover, "videoUrl": video,
             "download": request.url_root.rstrip("/") + "/api/rednote?url=" + quote(link) + "&dl=1"
+        })
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+# ══════════════════════════════════════════════
+#                  KUAISHOU (NEW)
+# ══════════════════════════════════════════════
+
+def ks_extract_from_flat(flat):
+    m = re.search(r'"photoUrl"\s*:\s*"([^"]+)"', flat)
+    if m:
+        return m.group(1)
+    m = re.search(r'(https?://[^"\s\'<>]+?\.mp4[^"\s\'<>]*)', flat)
+    if m:
+        return m.group(1)
+    return None
+
+
+@app.route("/api/kuaishou")
+def kuaishou():
+    link = (request.args.get("url") or "").strip()
+    dl = request.args.get("dl") == "1"
+    debug = request.args.get("debug") == "1"
+
+    if not link:
+        return jsonify({"error": "Link missing hai"}), 400
+    if not link.startswith("http"):
+        link = "https://" + link
+    if not re.search(r"(kuaishou|chenzhongtech)\.com", link, re.I):
+        return jsonify({"error": "Ye Kuaishou link nahi hai"}), 400
+
+    try:
+        # Chrome TLS fingerprint session — Kuaishou ko bot nahi lagta
+        s = cr.Session(impersonate="chrome124")
+
+        # 1) Warm-up — homepage se did cookie lo (session khud yaad rakhta hai)
+        try:
+            s.get("https://www.kuaishou.com/", headers={"User-Agent": UA_PC}, timeout=10)
+        except Exception:
+            pass
+
+        # 2) Short link resolve
+        final = link
+        for _ in range(5):
+            r = s.get(final, allow_redirects=False, headers={
+                "User-Agent": UA_PC,
+                "Referer": "https://www.kuaishou.com/"
+            }, timeout=12)
+            loc = r.headers.get("Location")
+            if loc:
+                final = urljoin(final, loc)
+                continue
+            break
+
+        # 3) Photo ID
+        m = re.search(r"/short-video/([0-9A-Za-z_-]+)", final) or \
+            re.search(r"/photo/([0-9A-Za-z_-]{10,})", final)
+        if not m:
+            return jsonify({"error": "Video ID nahi mili — sirf single video ka link do",
+                            **({"finalUrl": final} if debug else {})}), 400
+        photo_id = m.group(1)
+
+        # 4) GraphQL API — session cookies (did) ke saath
+        video = None
+        caption = None
+        cover = None
+        gq_err = None
+        try:
+            gq = s.post("https://www.kuaishou.com/graphql",
+                        headers={
+                            "User-Agent": UA_PC,
+                            "Content-Type": "application/json",
+                            "Accept": "*/*",
+                            "Referer": f"https://www.kuaishou.com/short-video/{photo_id}",
+                            "Origin": "https://www.kuaishou.com"
+                        },
+                        json={
+                            "operationName": "visionVideoDetail",
+                            "variables": {"photoId": photo_id, "page": "vision"},
+                            "query": "query visionVideoDetail($photoId: String, $page: String) { visionVideoDetail(photoId: $photoId, page: $page) { status photo { id caption photoUrl coverUrl } } }"
+                        }, timeout=15)
+            gj = gq.json()
+            ph = gj.get("data", {}).get("visionVideoDetail", {}).get("photo") if isinstance(gj, dict) else None
+            if ph and ph.get("photoUrl"):
+                video = ph["photoUrl"]
+                caption = ph.get("caption")
+                cover = ph.get("coverUrl")
+            elif debug:
+                gq_err = str(gj)[:300]
+        except Exception as e:
+            gq_err = f"{type(e).__name__}: {e}"
+
+        # 5) Fallback — HTML page se
+        if not video:
+            try:
+                page = s.get(f"https://www.kuaishou.com/short-video/{photo_id}", headers={
+                    "User-Agent": UA_PC,
+                    "Referer": "https://www.kuaishou.com/"
+                }, timeout=15)
+                flat = unesc(page.text)
+                video = ks_extract_from_flat(flat)
+                if not cover:
+                    cm = re.search(r'"coverUrl"\s*:\s*"([^"]+)"', flat) or \
+                         re.search(r'og:image[^>]+content="([^"]+)"', flat)
+                    cover = cm.group(1) if cm else None
+                if not caption:
+                    tm = re.search(r'"caption"\s*:\s*"([^"]*)"', flat) or \
+                         re.search(r'og:title[^>]+content="([^"]+)"', flat)
+                    caption = tm.group(1) if tm else None
+            except Exception:
+                pass
+
+        if debug and not video:
+            return jsonify({
+                "error": "Video URL nahi mila", "photoId": photo_id,
+                "finalUrl": final, "gqErr": gq_err
+            }), 200
+
+        if not video:
+            return jsonify({"error": "Video URL nahi mila — debug=1 ke saath try karo"}), 200
+
+        # 6) Direct download
+        if dl:
+            rr = s.get(video, headers={"User-Agent": UA_PC, "Referer": "https://www.kuaishou.com/"},
+                       stream=True, timeout=30)
+
+            def gen():
+                for chunk in rr.iter_content(65536):
+                    if chunk:
+                        yield chunk
+
+            return Response(gen(), headers={
+                "Content-Type": "video/mp4",
+                "Content-Disposition": f'attachment; filename="kuaishou-{photo_id}.mp4"'
+            })
+
+        return jsonify({
+            "platform": "kuaishou", "type": "video",
+            "title": (caption or "Kuaishou Video").strip(),
+            "cover": cover, "videoUrl": video,
+            "download": request.url_root.rstrip("/") + "/api/kuaishou?url=" + quote(link) + "&dl=1"
         })
 
     except Exception as e:
