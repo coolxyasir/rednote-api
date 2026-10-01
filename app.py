@@ -9,8 +9,8 @@ app = Flask(__name__)
 UA_PC = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 UA_MOB = "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
 
-# ══ Multiple TLS fingerprints — ek connection reset ho to dusra try hota hai ══
-PROFILES = ["chrome124", "chrome120", "chrome131", "safari17_0", "edge101", "firefox133"]
+# Sirf universally-supported TLS profiles — unsupported wale skip ho jayenge
+PROFILES = ["chrome124", "chrome120", "edge101", "safari15_5"]
 
 
 @app.after_request
@@ -23,14 +23,13 @@ def add_cors_headers(resp):
 
 @app.route("/")
 def home():
-    return jsonify({"service": "rednote-api", "version": "curl_cffi-v7-rotate"})
+    return jsonify({"service": "rednote-api", "version": "curl_cffi-v7.1-safe"})
 
 
 def unesc(s):
     out = s.replace("\\u002F", "/").replace("\\/", "/")
     out = re.sub(r"\\u([0-9a-fA-F]{4})", lambda m: chr(int(m.group(1), 16)), out)
     out = out.replace("&quot;", '"').replace("&#39;", "'").replace("&amp;", "&")
-    out = out.replace("&#x2F;", "/").replace("&#47;", "/")
     return out
 
 
@@ -48,37 +47,34 @@ def full_unquote(s):
     return s
 
 
-# ══════════════════════════════════════════════
-#                 KUAISHOU
-# ══════════════════════════════════════════════
-
-def ks_extract_from_flat(flat):
-    m = re.search(r'"photoUrl"\s*:\s*"([^"]+)"', flat)
-    if m:
-        return m.group(1)
-    m = re.search(r'(https?://[^"\s\'<>]+?\.mp4[^"\s\'<>]*)', flat)
-    if m:
-        return m.group(1)
-    return None
+def safe_session(profile):
+    """Unsupported profile ho to None return karo (crash nahi)"""
+    try:
+        return cr.Session(impersonate=profile)
+    except Exception:
+        return None
 
 
-def ks_try_one_profile(profile, link, debug):
-    """Ek TLS fingerprint ke saath pura extraction — fail hua to exception"""
-    s = cr.Session(impersonate=profile)
+# ═══════════════ KUAISHOU ═══════════════
 
-    # Warm-up — did cookie session me aa jayegi
+def ks_one(profile, link, debug):
+    s = safe_session(profile)
+    if s is None:
+        raise Exception("profile unsupported: " + profile)
+
     try:
         s.get("https://www.kuaishou.com/", headers={"User-Agent": UA_PC}, timeout=10)
     except Exception:
         pass
 
-    # Short link resolve
     final = link
     for _ in range(5):
-        r = s.get(final, allow_redirects=False, headers={
-            "User-Agent": UA_PC,
-            "Referer": "https://www.kuaishou.com/"
-        }, timeout=12)
+        try:
+            r = s.get(final, allow_redirects=False, headers={
+                "User-Agent": UA_PC, "Referer": "https://www.kuaishou.com/"
+            }, timeout=12)
+        except Exception:
+            raise ConnectionError("connection failed")
         loc = r.headers.get("Location")
         if loc:
             final = urljoin(final, loc)
@@ -94,16 +90,14 @@ def ks_try_one_profile(profile, link, debug):
     video = None
     caption = None
     cover = None
-    gq_err = None
 
-    # GraphQL
     try:
         gq = s.post("https://www.kuaishou.com/graphql",
                     headers={
                         "User-Agent": UA_PC,
                         "Content-Type": "application/json",
                         "Accept": "*/*",
-                        "Referer": f"https://www.kuaishou.com/short-video/{photo_id}",
+                        "Referer": "https://www.kuaishou.com/short-video/" + photo_id,
                         "Origin": "https://www.kuaishou.com"
                     },
                     json={
@@ -117,108 +111,102 @@ def ks_try_one_profile(profile, link, debug):
             video = ph["photoUrl"]
             caption = ph.get("caption")
             cover = ph.get("coverUrl")
-        elif debug:
-            gq_err = str(gj)[:300]
-    except Exception as e:
-        gq_err = f"{type(e).__name__}: {e}"
+    except Exception:
+        pass
 
-    # HTML fallback
     if not video:
         try:
-            page = s.get(f"https://www.kuaishou.com/short-video/{photo_id}", headers={
-                "User-Agent": UA_PC,
-                "Referer": "https://www.kuaishou.com/"
+            page = s.get("https://www.kuaishou.com/short-video/" + photo_id, headers={
+                "User-Agent": UA_PC, "Referer": "https://www.kuaishou.com/"
             }, timeout=15)
             flat = unesc(page.text)
-            video = ks_extract_from_flat(flat)
+            m2 = re.search(r'"photoUrl"\s*:\s*"([^"]+)"', flat) or \
+                 re.search(r'(https?://[^"\s\'<>]+?\.mp4[^"\s\'<>]*)', flat)
+            if m2:
+                video = m2.group(1)
             if video and not cover:
                 cm = re.search(r'"coverUrl"\s*:\s*"([^"]+)"', flat) or \
                      re.search(r'og:image[^>]+content="([^"]+)"', flat)
                 cover = cm.group(1) if cm else None
             if video and not caption:
-                tm = re.search(r'"caption"\s*:\s*"([^"]*)"', flat) or \
-                     re.search(r'og:title[^>]+content="([^"]+)"', flat)
+                tm = re.search(r'"caption"\s*:\s*"([^"]*)"', flat)
                 caption = tm.group(1) if tm else None
         except Exception:
             pass
 
     if not video:
-        raise ValueError(f"Video URL nahi mila ({profile}) gqErr={gq_err}")
+        raise Exception("Video URL nahi mila (" + profile + ")")
 
-    return {"photoId": photo_id, "video": video, "caption": caption, "cover": cover, "session": s}
+    return {"photoId": photo_id, "video": video, "caption": caption,
+            "cover": cover, "session": s}
 
 
 @app.route("/api/kuaishou")
 def kuaishou():
-    link = (request.args.get("url") or "").strip()
-    dl = request.args.get("dl") == "1"
-    debug = request.args.get("debug") == "1"
+    try:
+        link = (request.args.get("url") or "").strip()
+        dl = request.args.get("dl") == "1"
+        debug = request.args.get("debug") == "1"
 
-    if not link:
-        return jsonify({"error": "Link missing hai"}), 400
-    if not link.startswith("http"):
-        link = "https://" + link
-    if not re.search(r"(kuaishou|chenzhongtech)\.com", link, re.I):
-        return jsonify({"error": "Ye Kuaishou link nahi hai"}), 400
+        if not link:
+            return jsonify({"error": "Link missing hai"}), 400
+        if not link.startswith("http"):
+            link = "https://" + link
+        if not re.search(r"(kuaishou|chenzhongtech)\.com", link, re.I):
+            return jsonify({"error": "Ye Kuaishou link nahi hai"}), 400
 
-    errors = []
-    result = None
-    used_profile = None
+        errors = []
+        result = None
+        used = None
 
-    # ══ Profile rotation — ek fingerprint fail => agla try ══
-    for profile in PROFILES:
-        try:
-            result = ks_try_one_profile(profile, link, debug)
-            used_profile = profile
-            break
-        except ValueError as ve:
-            # ID nahi mili = link ka problem, profile badalne se nahi sudhrega
-            if "Video ID nahi mili" in str(ve):
+        for profile in PROFILES:
+            try:
+                result = ks_one(profile, link, debug)
+                used = profile
+                break
+            except ValueError as ve:
                 return jsonify({"error": str(ve)}), 400
-            errors.append(str(ve))
-            time.sleep(0.7)
-        except Exception as e:
-            errors.append(f"{profile}: {type(e).__name__}: {e}")
-            time.sleep(0.7)
+            except Exception as e:
+                errors.append(profile + ": " + type(e).__name__)
+                time.sleep(0.6)
 
-    if not result:
-        if debug:
-            return jsonify({"error": "Sab TLS profiles fail ho gaye", "attempts": errors}), 200
-        return jsonify({"error": "Video fetch nahi ho payi (connection blocked) — thodi der baad try karo"}), 200
+        if not result:
+            return jsonify({"error": "Video fetch nahi ho payi — thodi der baad try karo",
+                            "attempts": errors if debug else None}), 200
 
-    video = result["video"]
-    photo_id = result["photoId"]
+        video = result["video"]
+        photo_id = result["photoId"]
 
-    if dl:
-        try:
-            rr = result["session"].get(video, headers={"User-Agent": UA_PC, "Referer": "https://www.kuaishou.com/"},
-                                      stream=True, timeout=30)
+        if dl:
+            try:
+                rr = result["session"].get(video, headers={
+                    "User-Agent": UA_PC, "Referer": "https://www.kuaishou.com/"
+                }, stream=True, timeout=30)
 
-            def gen():
-                for chunk in rr.iter_content(65536):
-                    if chunk:
-                        yield chunk
+                def gen():
+                    for chunk in rr.iter_content(65536):
+                        if chunk:
+                            yield chunk
 
-            return Response(gen(), headers={
-                "Content-Type": "video/mp4",
-                "Content-Disposition": f'attachment; filename="kuaishou-{photo_id}.mp4"'
-            })
-        except Exception:
-            # download me reset aaya to bina session ke direct redirect bhejo
-            return jsonify({"platform": "kuaishou", "videoUrl": video,
-                            "note": "Proxy download fail — Direct Link se download karo"})
+                return Response(gen(), headers={
+                    "Content-Type": "video/mp4",
+                    "Content-Disposition": "attachment; filename=kuaishou-" + photo_id + ".mp4"
+                })
+            except Exception:
+                return jsonify({"platform": "kuaishou", "videoUrl": video,
+                                "note": "Direct Link se download karo"})
 
-    return jsonify({
-        "platform": "kuaishou", "type": "video", "attempt": used_profile,
-        "title": (result["caption"] or "Kuaishou Video").strip(),
-        "cover": result["cover"], "videoUrl": video,
-        "download": request.url_root.rstrip("/") + "/api/kuaishou?url=" + quote(link) + "&dl=1"
-    })
+        return jsonify({
+            "platform": "kuaishou", "type": "video", "attempt": used,
+            "title": (result["caption"] or "Kuaishou Video").strip(),
+            "cover": result["cover"], "videoUrl": video,
+            "download": request.url_root.rstrip("/") + "/api/kuaishou?url=" + quote(link) + "&dl=1"
+        })
+    except Exception as e:
+        return jsonify({"error": "Server error: " + str(e)}), 200
 
 
-# ══════════════════════════════════════════════
-#                  REDNOTE
-# ══════════════════════════════════════════════
+# ═══════════════ REDNOTE ═══════════════
 
 def find_video(flat):
     for pat in [
@@ -226,7 +214,6 @@ def find_video(flat):
         r'"streamUrl":"(https:[^"]+)"',
         r'"videoUrl":"(https:[^"]+\.mp4[^"]*)"',
         r'(https://sns-video[^"\s\'<>]+?\.mp4[^"\s\'<>]*)',
-        r'(https://[^"\s\'<>]+?\.mp4\?[^"\s\'<>]+)',
     ]:
         m = re.search(pat, flat)
         if m:
@@ -234,8 +221,10 @@ def find_video(flat):
     return None
 
 
-def rn_try_one_profile(profile, link, debug):
-    s = cr.Session(impersonate=profile)
+def rn_one(profile, link, debug):
+    s = safe_session(profile)
+    if s is None:
+        raise Exception("profile unsupported: " + profile)
 
     try:
         s.get("https://www.xiaohongshu.com/", headers={"User-Agent": UA_PC}, timeout=10)
@@ -244,10 +233,12 @@ def rn_try_one_profile(profile, link, debug):
 
     final = link
     for _ in range(5):
-        r = s.get(final, allow_redirects=False, headers={
-            "User-Agent": UA_MOB,
-            "Referer": "https://www.xiaohongshu.com/"
-        }, timeout=15)
+        try:
+            r = s.get(final, allow_redirects=False, headers={
+                "User-Agent": UA_MOB, "Referer": "https://www.xiaohongshu.com/"
+            }, timeout=15)
+        except Exception:
+            raise ConnectionError("connection failed")
         loc = r.headers.get("Location")
         if loc:
             final = urljoin(final, loc)
@@ -277,17 +268,18 @@ def rn_try_one_profile(profile, link, debug):
     if original_note_url and "/discovery/item/" in original_note_url:
         candidates.append(("original-discovery", original_note_url, UA_MOB))
     candidates.append(("rebuilt-explore",
-                       f"https://www.xiaohongshu.com/explore/{note_id}?xsec_token={quote(token, safe='')}&xsec_source={quote(source, safe='')}",
+                       "https://www.xiaohongshu.com/explore/" + note_id +
+                       "?xsec_token=" + quote(token, safe='') + "&xsec_source=" + quote(source, safe=''),
                        UA_PC))
     candidates.append(("rebuilt-discovery",
-                       f"https://www.xiaohongshu.com/discovery/item/{note_id}?xsec_token={quote(token, safe='')}&xsec_source={quote(source, safe='')}",
+                       "https://www.xiaohongshu.com/discovery/item/" + note_id +
+                       "?xsec_token=" + quote(token, safe='') + "&xsec_source=" + quote(source, safe=''),
                        UA_MOB))
 
     video = None
     cover = None
     title = ""
     desc = ""
-    images = []
     best_flat = ""
     used = None
 
@@ -296,11 +288,10 @@ def rn_try_one_profile(profile, link, debug):
             page = s.get(web, headers={
                 "User-Agent": ua,
                 "Referer": "https://www.xiaohongshu.com/",
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept": "text/html,application/xhtml+xml",
                 "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8"
             }, timeout=20)
             flat = unesc(page.text)
-
             v = find_video(flat)
             if v:
                 video = v
@@ -314,110 +305,95 @@ def rn_try_one_profile(profile, link, debug):
                 dm = re.search(r'"desc":"([^"]*)"', flat)
                 desc = dm.group(1) if dm else ""
                 break
-
             if "noteDetailMap" in flat and not best_flat:
                 best_flat = flat
         except Exception:
             continue
 
-    if not video and not (best_flat or ""):
-        raise ConnectionError(f"RedNote se connection hi nahi hua ({profile})")
-
     return {"noteId": note_id, "video": video, "cover": cover, "title": title,
-            "desc": desc, "images": images, "best_flat": best_flat, "used": used, "session": s}
+            "desc": desc, "best_flat": best_flat, "used": used, "session": s}
 
 
 @app.route("/api/rednote")
 def rednote():
-    link = (request.args.get("url") or "").strip()
-    dl = request.args.get("dl") == "1"
-    debug = request.args.get("debug") == "1"
+    try:
+        link = (request.args.get("url") or "").strip()
+        dl = request.args.get("dl") == "1"
+        debug = request.args.get("debug") == "1"
 
-    if not link:
-        return jsonify({"error": "Link missing hai"}), 400
-    if not link.startswith("http"):
-        link = "https://" + link
-    if not re.search(r"(xiaohongshu|xhslink)\.com", link, re.I):
-        return jsonify({"error": "Ye RedNote link nahi hai"}), 400
+        if not link:
+            return jsonify({"error": "Link missing hai"}), 400
+        if not link.startswith("http"):
+            link = "https://" + link
+        if not re.search(r"(xiaohongshu|xhslink)\.com", link, re.I):
+            return jsonify({"error": "Ye RedNote link nahi hai"}), 400
 
-    errors = []
-    result = None
-    used_profile = None
+        result = None
+        used = None
 
-    for profile in PROFILES:
-        try:
-            result = rn_try_one_profile(profile, link, debug)
-            used_profile = profile
-            break
-        except ValueError as ve:
-            return jsonify({"error": str(ve)}), 400
-        except Exception as e:
-            errors.append(f"{profile}: {type(e).__name__}: {e}")
-            time.sleep(0.7)
+        for profile in PROFILES:
+            try:
+                result = rn_one(profile, link, debug)
+                used = profile
+                break
+            except ValueError as ve:
+                return jsonify({"error": str(ve)}), 400
+            except Exception:
+                time.sleep(0.6)
 
-    if not result:
-        if debug:
-            return jsonify({"error": "Sab TLS profiles fail ho gaye", "attempts": errors}), 200
-        return jsonify({"error": "RedNote fetch nahi ho payi — thodi der baad try karo"}), 200
+        if not result:
+            return jsonify({"error": "RedNote fetch nahi ho payi — thodi der baad try karo"}), 200
 
-    video = result["video"]
-    note_id = result["noteId"]
-    title = result["title"]
-    desc = result["desc"]
-    cover = result["cover"]
-    images = result["images"]
-    best_flat = result["best_flat"]
+        video = result["video"]
+        note_id = result["noteId"]
+        title = result["title"]
+        desc = result["desc"]
+        cover = result["cover"]
+        best_flat = result["best_flat"]
 
-    if debug and not video:
-        idx = best_flat.find("serverRequestInfo")
-        errsnippet = best_flat[idx:idx + 200] if idx >= 0 else "(serverRequestInfo nahi mila)"
+        if not video:
+            images = []
+            seen = set()
+            for im in re.finditer(r'"urlDefault":"(https:[^"]+)"', best_flat or ""):
+                if im.group(1) not in seen:
+                    seen.add(im.group(1))
+                    images.append(im.group(1))
+            images = images[:10]
+            if images:
+                return jsonify({
+                    "platform": "rednote", "type": "images",
+                    "title": (title or desc or "RedNote Post").strip(),
+                    "cover": cover or images[0], "images": images
+                })
+            return jsonify({"error": "Video URL nahi mila — debug=1 ke saath try karo"}), 200
+
+        if dl:
+            try:
+                rr = result["session"].get(video, headers={
+                    "User-Agent": UA_PC, "Referer": "https://www.xiaohongshu.com/"
+                }, stream=True, timeout=30)
+
+                def gen():
+                    for chunk in rr.iter_content(65536):
+                        if chunk:
+                            yield chunk
+
+                return Response(gen(), headers={
+                    "Content-Type": "video/mp4",
+                    "Content-Disposition": "attachment; filename=rednote-" + note_id + ".mp4"
+                })
+            except Exception:
+                return jsonify({"platform": "rednote", "videoUrl": video,
+                                "note": "Direct Link se download karo"})
+
         return jsonify({
-            "error": "Video URL nahi mila", "noteId": note_id,
-            "tokenOk": True, "errSnippet": errsnippet
-        }), 200
-
-    if not video:
-        seen = set()
-        for im in re.finditer(r'"urlDefault":"(https:[^"]+)"', best_flat or ""):
-            if im.group(1) not in seen:
-                seen.add(im.group(1))
-                images.append(im.group(1))
-        images = images[:10]
-
-    if not video and images:
-        return jsonify({
-            "platform": "rednote", "type": "images",
-            "title": (title or desc or "RedNote Post").strip(),
-            "cover": cover or images[0], "images": images
+            "platform": "rednote", "type": "video", "attempt": result["used"], "profile": used,
+            "title": (title or desc or "RedNote Video").strip(),
+            "cover": cover, "videoUrl": video,
+            "download": request.url_root.rstrip("/") + "/api/rednote?url=" + quote(link) + "&dl=1"
         })
-
-    if not video:
-        return jsonify({"error": "Video URL nahi mila — debug=1 ke saath try karo"}), 200
-
-    if dl:
-        try:
-            rr = result["session"].get(video, headers={"User-Agent": UA_PC, "Referer": "https://www.xiaohongshu.com/"},
-                                      stream=True, timeout=30)
-
-            def gen():
-                for chunk in rr.iter_content(65536):
-                    if chunk:
-                        yield chunk
-
-            return Response(gen(), headers={
-                "Content-Type": "video/mp4",
-                "Content-Disposition": f'attachment; filename="rednote-{note_id}.mp4"'
-            })
-        except Exception:
-            return jsonify({"platform": "rednote", "videoUrl": video,
-                            "note": "Proxy download fail — Direct Link se download karo"})
-
-    return jsonify({
-        "platform": "rednote", "type": "video", "attempt": result["used"], "profile": used_profile,
-        "title": (title or desc or "RedNote Video").strip(),
-        "cover": cover, "videoUrl": video,
-        "download": request.url_root.rstrip("/") + "/api/rednote?url=" + quote(link) + "&dl=1"
-    })
+    except Exception as e:
+        return jsonify({"error": "Server error: " + str(e)}), 200
 
 
 if __name__ == "__main__":
