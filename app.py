@@ -9,8 +9,10 @@ app = Flask(__name__)
 UA_PC = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 UA_MOB = "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
 
-# Sirf universally-supported TLS profiles — unsupported wale skip ho jayenge
+# ══ Sirf universally-supported TLS profiles ══
 PROFILES = ["chrome124", "chrome120", "edge101", "safari15_5"]
+# ══ Rotation limit — zyada profiles = gunicorn timeout kill ══
+MAX_PROFILES = 2
 
 
 @app.after_request
@@ -23,7 +25,7 @@ def add_cors_headers(resp):
 
 @app.route("/")
 def home():
-    return jsonify({"service": "rednote-api", "version": "curl_cffi-v7.1-safe"})
+    return jsonify({"service": "rednote-api", "version": "curl_cffi-v7.2-timeoutfix"})
 
 
 def unesc(s):
@@ -55,24 +57,28 @@ def safe_session(profile):
         return None
 
 
-# ═══════════════ KUAISHOU ═══════════════
+# ══════════════════════════════════════════════
+#                 KUAISHOU
+# ══════════════════════════════════════════════
 
 def ks_one(profile, link, debug):
     s = safe_session(profile)
     if s is None:
         raise Exception("profile unsupported: " + profile)
 
+    # Warm-up — did cookie session me aa jayegi
     try:
-        s.get("https://www.kuaishou.com/", headers={"User-Agent": UA_PC}, timeout=10)
+        s.get("https://www.kuaishou.com/", headers={"User-Agent": UA_PC}, timeout=8)
     except Exception:
         pass
 
+    # Short link resolve
     final = link
-    for _ in range(5):
+    for _ in range(4):
         try:
             r = s.get(final, allow_redirects=False, headers={
                 "User-Agent": UA_PC, "Referer": "https://www.kuaishou.com/"
-            }, timeout=12)
+            }, timeout=10)
         except Exception:
             raise ConnectionError("connection failed")
         loc = r.headers.get("Location")
@@ -91,6 +97,7 @@ def ks_one(profile, link, debug):
     caption = None
     cover = None
 
+    # GraphQL
     try:
         gq = s.post("https://www.kuaishou.com/graphql",
                     headers={
@@ -104,7 +111,7 @@ def ks_one(profile, link, debug):
                         "operationName": "visionVideoDetail",
                         "variables": {"photoId": photo_id, "page": "vision"},
                         "query": "query visionVideoDetail($photoId: String, $page: String) { visionVideoDetail(photoId: $photoId, page: $page) { status photo { id caption photoUrl coverUrl } } }"
-                    }, timeout=15)
+                    }, timeout=12)
         gj = gq.json()
         ph = gj.get("data", {}).get("visionVideoDetail", {}).get("photo") if isinstance(gj, dict) else None
         if ph and ph.get("photoUrl"):
@@ -114,11 +121,12 @@ def ks_one(profile, link, debug):
     except Exception:
         pass
 
+    # HTML fallback
     if not video:
         try:
             page = s.get("https://www.kuaishou.com/short-video/" + photo_id, headers={
                 "User-Agent": UA_PC, "Referer": "https://www.kuaishou.com/"
-            }, timeout=15)
+            }, timeout=12)
             flat = unesc(page.text)
             m2 = re.search(r'"photoUrl"\s*:\s*"([^"]+)"', flat) or \
                  re.search(r'(https?://[^"\s\'<>]+?\.mp4[^"\s\'<>]*)', flat)
@@ -159,7 +167,8 @@ def kuaishou():
         result = None
         used = None
 
-        for profile in PROFILES:
+        # ══ MAX_PROFILES tak hi rotation — timeout se bachne ke liye ══
+        for profile in PROFILES[:MAX_PROFILES]:
             try:
                 result = ks_one(profile, link, debug)
                 used = profile
@@ -171,7 +180,7 @@ def kuaishou():
                 time.sleep(0.6)
 
         if not result:
-            return jsonify({"error": "Video fetch nahi ho payi — thodi der baad try karo",
+            return jsonify({"error": "Video fetch nahi ho payi — fresh link ke saath try karo",
                             "attempts": errors if debug else None}), 200
 
         video = result["video"]
@@ -206,7 +215,9 @@ def kuaishou():
         return jsonify({"error": "Server error: " + str(e)}), 200
 
 
-# ═══════════════ REDNOTE ═══════════════
+# ══════════════════════════════════════════════
+#                 REDNOTE
+# ══════════════════════════════════════════════
 
 def find_video(flat):
     for pat in [
@@ -227,16 +238,16 @@ def rn_one(profile, link, debug):
         raise Exception("profile unsupported: " + profile)
 
     try:
-        s.get("https://www.xiaohongshu.com/", headers={"User-Agent": UA_PC}, timeout=10)
+        s.get("https://www.xiaohongshu.com/", headers={"User-Agent": UA_PC}, timeout=8)
     except Exception:
         pass
 
     final = link
-    for _ in range(5):
+    for _ in range(4):
         try:
             r = s.get(final, allow_redirects=False, headers={
                 "User-Agent": UA_MOB, "Referer": "https://www.xiaohongshu.com/"
-            }, timeout=15)
+            }, timeout=12)
         except Exception:
             raise ConnectionError("connection failed")
         loc = r.headers.get("Location")
@@ -290,7 +301,7 @@ def rn_one(profile, link, debug):
                 "Referer": "https://www.xiaohongshu.com/",
                 "Accept": "text/html,application/xhtml+xml",
                 "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8"
-            }, timeout=20)
+            }, timeout=15)
             flat = unesc(page.text)
             v = find_video(flat)
             if v:
@@ -331,7 +342,7 @@ def rednote():
         result = None
         used = None
 
-        for profile in PROFILES:
+        for profile in PROFILES[:MAX_PROFILES]:
             try:
                 result = rn_one(profile, link, debug)
                 used = profile
@@ -342,7 +353,7 @@ def rednote():
                 time.sleep(0.6)
 
         if not result:
-            return jsonify({"error": "RedNote fetch nahi ho payi — thodi der baad try karo"}), 200
+            return jsonify({"error": "RedNote fetch nahi ho payi — fresh link ke saath try karo"}), 200
 
         video = result["video"]
         note_id = result["noteId"]
