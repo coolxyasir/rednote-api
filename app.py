@@ -9,18 +9,18 @@ UA_PC = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, li
 UA_MOB = "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
 
 
-def cors(d):
-    d.update({
-        "Access-Control-Allow-Origin": "*",
-        "Access-Control-Allow-Methods": "GET, OPTIONS",
-        "Access-Control-Allow-Headers": "Content-Type"
-    })
-    return d
+# ══ FIXED: CORS ab ASLI HTTP headers me jayenge (JSON body me nahi) ══
+@app.after_request
+def add_cors_headers(resp):
+    resp.headers["Access-Control-Allow-Origin"] = "*"
+    resp.headers["Access-Control-Allow-Methods"] = "GET, OPTIONS"
+    resp.headers["Access-Control-Allow-Headers"] = "Content-Type"
+    return resp
 
 
 @app.route("/")
 def home():
-    return jsonify(cors({"service": "rednote-api", "version": "curl_cffi-v1"}))
+    return jsonify({"service": "rednote-api", "version": "curl_cffi-v2-corsfix"})
 
 
 def unesc(s):
@@ -36,11 +36,11 @@ def rednote():
     debug = request.args.get("debug") == "1"
 
     if not link:
-        return jsonify(cors({"error": "Link missing hai"})), 400
+        return jsonify({"error": "Link missing hai"}), 400
     if not link.startswith("http"):
         link = "https://" + link
     if not re.search(r"(xiaohongshu|xhslink)\.com", link, re.I):
-        return jsonify(cors({"error": "Ye RedNote link nahi hai"})), 400
+        return jsonify({"error": "Ye RedNote link nahi hai"}), 400
 
     try:
         # Chrome TLS fingerprint wala session (dlbunny wala trick)
@@ -72,7 +72,7 @@ def rednote():
         # 3) Note ID + token
         m = re.search(r"/(?:explore|discovery/item)/([0-9a-zA-Z]+)", final)
         if not m:
-            return jsonify(cors({"error": "Note ID nahi mili", **({"finalUrl": final} if debug else {})})), 400
+            return jsonify({"error": "Note ID nahi mili", **({"finalUrl": final} if debug else {})}), 400
         note_id = m.group(1)
 
         t = re.search(r"xsec_token=([^&]+)", final)
@@ -118,7 +118,7 @@ def rednote():
 
         if debug and not video:
             titm = re.search(r"<title>([^<]+)</title>", html)
-            return jsonify(cors({
+            return jsonify({
                 "error": "Video URL nahi mila", "noteId": note_id,
                 "stateFound": "__INITIAL_STATE__" in html,
                 "hasNoteDetail": "noteDetailMap" in flat,
@@ -126,18 +126,18 @@ def rednote():
                 "pageTitle": titm.group(1) if titm else None,
                 "imagesMili": len(images),
                 "pageStart": html[:600]
-            })), 200
+            }), 200
 
         # Image post (video nahi hai)
         if not video and images:
-            return jsonify(cors({
+            return jsonify({
                 "platform": "rednote", "type": "images",
                 "title": (title or desc or "RedNote Post").strip(),
                 "cover": cover or images[0], "images": images
-            }))
+            })
 
         if not video:
-            return jsonify(cors({"error": "Video URL nahi mila - debug=1 ke saath try karo"})), 200
+            return jsonify({"error": "Video URL nahi mila - debug=1 ke saath try karo"}), 200
 
         # 6) Direct download mode
         if dl:
@@ -154,15 +154,15 @@ def rednote():
                 "Content-Disposition": f'attachment; filename="rednote-{note_id}.mp4"'
             })
 
-        return jsonify(cors({
+        return jsonify({
             "platform": "rednote", "type": "video",
             "title": (title or desc or "RedNote Video").strip(),
             "cover": cover, "videoUrl": video,
             "download": request.url_root.rstrip("/") + "/api/rednote?url=" + quote(link) + "&dl=1"
-        }))
+        })
 
     except Exception as e:
-        return jsonify(cors({"error": str(e)})), 500
+        return jsonify({"error": str(e)}), 500
 
 
 if __name__ == "__main__":
