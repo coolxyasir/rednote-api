@@ -25,7 +25,7 @@ def add_cors_headers(resp):
 
 @app.route("/")
 def home():
-    return jsonify({"service": "rednote-api", "version": "curl_cffi-v7.2-timeoutfix"})
+    return jsonify({"service": "rednote-api", "version": "curl_cffi-v7.3-diag"})
 
 
 def unesc(s):
@@ -66,11 +66,14 @@ def ks_one(profile, link, debug):
     if s is None:
         raise Exception("profile unsupported: " + profile)
 
+    gq_err = None
+
     # Warm-up — did cookie session me aa jayegi
     try:
         s.get("https://www.kuaishou.com/", headers={"User-Agent": UA_PC}, timeout=8)
-    except Exception:
-        pass
+    except Exception as e:
+        if debug:
+            gq_err = "warmup: " + type(e).__name__
 
     # Short link resolve
     final = link
@@ -79,8 +82,8 @@ def ks_one(profile, link, debug):
             r = s.get(final, allow_redirects=False, headers={
                 "User-Agent": UA_PC, "Referer": "https://www.kuaishou.com/"
             }, timeout=10)
-        except Exception:
-            raise ConnectionError("connection failed")
+        except Exception as e:
+            raise ConnectionError(f"redirect-fail|{type(e).__name__}: {e}")
         loc = r.headers.get("Location")
         if loc:
             final = urljoin(final, loc)
@@ -98,6 +101,8 @@ def ks_one(profile, link, debug):
     cover = None
 
     # GraphQL
+    gq_status = None
+    gq_body = None
     try:
         gq = s.post("https://www.kuaishou.com/graphql",
                     headers={
@@ -112,26 +117,36 @@ def ks_one(profile, link, debug):
                         "variables": {"photoId": photo_id, "page": "vision"},
                         "query": "query visionVideoDetail($photoId: String, $page: String) { visionVideoDetail(photoId: $photoId, page: $page) { status photo { id caption photoUrl coverUrl } } }"
                     }, timeout=12)
-        gj = gq.json()
-        ph = gj.get("data", {}).get("visionVideoDetail", {}).get("photo") if isinstance(gj, dict) else None
-        if ph and ph.get("photoUrl"):
-            video = ph["photoUrl"]
-            caption = ph.get("caption")
-            cover = ph.get("coverUrl")
-    except Exception:
-        pass
+        gq_status = gq.status_code
+        try:
+            gj = gq.json()
+            ph = gj.get("data", {}).get("visionVideoDetail", {}).get("photo") if isinstance(gj, dict) else None
+            if ph and ph.get("photoUrl"):
+                video = ph["photoUrl"]
+                caption = ph.get("caption")
+                cover = ph.get("coverUrl")
+            else:
+                gq_body = str(gj)[:250]
+        except Exception:
+            gq_body = gq.text[:250] if hasattr(gq, 'text') else "no-body"
+    except Exception as e:
+        gq_err = f"{type(e).__name__}: {e}"
 
     # HTML fallback
+    html_status = None
+    html_found = False
     if not video:
         try:
             page = s.get("https://www.kuaishou.com/short-video/" + photo_id, headers={
                 "User-Agent": UA_PC, "Referer": "https://www.kuaishou.com/"
             }, timeout=12)
+            html_status = page.status_code
             flat = unesc(page.text)
             m2 = re.search(r'"photoUrl"\s*:\s*"([^"]+)"', flat) or \
                  re.search(r'(https?://[^"\s\'<>]+?\.mp4[^"\s\'<>]*)', flat)
             if m2:
                 video = m2.group(1)
+                html_found = True
             if video and not cover:
                 cm = re.search(r'"coverUrl"\s*:\s*"([^"]+)"', flat) or \
                      re.search(r'og:image[^>]+content="([^"]+)"', flat)
@@ -139,11 +154,12 @@ def ks_one(profile, link, debug):
             if video and not caption:
                 tm = re.search(r'"caption"\s*:\s*"([^"]*)"', flat)
                 caption = tm.group(1) if tm else None
-        except Exception:
-            pass
+        except Exception as e:
+            html_status = type(e).__name__
 
     if not video:
-        raise Exception("Video URL nahi mila (" + profile + ")")
+        diag = f"no-video|{profile}|gqStatus={gq_status}|gqErr={gq_err}|gqBody={gq_body}|htmlStatus={html_status}|htmlFound={html_found}"
+        raise Exception(diag)
 
     return {"photoId": photo_id, "video": video, "caption": caption,
             "cover": cover, "session": s}
@@ -167,7 +183,7 @@ def kuaishou():
         result = None
         used = None
 
-        # ══ MAX_PROFILES tak hi rotation — timeout se bachne ke liye ══
+        # ══ MAX_PROFILES tak hi rotation ══
         for profile in PROFILES[:MAX_PROFILES]:
             try:
                 result = ks_one(profile, link, debug)
@@ -176,7 +192,7 @@ def kuaishou():
             except ValueError as ve:
                 return jsonify({"error": str(ve)}), 400
             except Exception as e:
-                errors.append(profile + ": " + type(e).__name__)
+                errors.append(str(e))
                 time.sleep(0.6)
 
         if not result:
